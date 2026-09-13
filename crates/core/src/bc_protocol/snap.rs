@@ -16,6 +16,15 @@ impl BcCamera {
 		// `CameraServiceUnavailable` and the CLI exit code maps to 5
 		// (protocol) instead of the more accurate 6 (unsupported).
 		self.has_ability_ro("preview").await?;
+		// Serialize snapshot fetches on this camera: `subscribe_to_id`
+		// keys its wildcard slot on `(MSG_ID_SNAP, None)` until the
+		// camera's first chunk reveals the real msg_num. Two concurrent
+		// `get_snapshot` calls (e.g. the preview poller tick racing an
+		// on-demand MQTT/RTSP-triggered snapshot) both take that slot,
+		// and the second silently replaces the first, splitting the
+		// binary chunks between the two callers. Holding this lock for
+		// the whole call closes that race. See `snap_lock` doc comment.
+		let _snap_guard = self.snap_lock.lock().await;
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();
 		let mut sub_get = connection.subscribe(MSG_ID_SNAP, msg_num).await?;
@@ -530,6 +539,102 @@ mod tests {
 		assert!(
 			matches!(err, Error::UnintelligibleReply { .. }),
 			"truncated snapshot should be UnintelligibleReply, got {err:?}"
+		);
+	}
+
+	/// Regression test for the `snap_lock` fix: two `get_snapshot`
+	/// calls firing concurrently on the same camera (e.g. the preview
+	/// poller tick racing an on-demand MQTT/RTSP-triggered snapshot)
+	/// must not cross-deliver binary chunks. Before the fix, both
+	/// calls raced to occupy the single `(MSG_ID_SNAP, None)` wildcard
+	/// subscriber slot in the poller and the second silently stole the
+	/// first's chunks, surfacing as "Snap truncated". With the lock
+	/// serialising the whole call, the second request isn't even sent
+	/// until the first has fully drained its chunks, so both
+	/// snapshots must come back complete and un-mixed.
+	#[tokio::test]
+	async fn get_snapshot_concurrent_calls_do_not_cross_deliver_chunks() {
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_SNAP)
+			.reply_with(|req| {
+				crate::bc_protocol::connection::mock::reply_200_xml(
+					req,
+					BcXml {
+						snap: Some(Snap {
+							version: "1.1".to_string(),
+							channel_id: 0,
+							logic_channel: Some(0),
+							time: 0,
+							full_frame: Some(0),
+							stream_type: Some("main".to_string()),
+							file_name: Some("a.jpg".to_string()),
+							picture_size: Some(3),
+						}),
+						..Default::default()
+					},
+				)
+			})
+			.expect_msg(MSG_ID_SNAP)
+			.reply_with(|req| {
+				crate::bc_protocol::connection::mock::reply_200_xml(
+					req,
+					BcXml {
+						snap: Some(Snap {
+							version: "1.1".to_string(),
+							channel_id: 0,
+							logic_channel: Some(0),
+							time: 0,
+							full_frame: Some(0),
+							stream_type: Some("main".to_string()),
+							file_name: Some("b.jpg".to_string()),
+							picture_size: Some(3),
+						}),
+						..Default::default()
+					},
+				)
+			})
+			.build()
+			.await;
+		let injector = mock.injector();
+		let cam = std::sync::Arc::new(BcCamera::from_mock_connection(mock).await);
+		cam.test_set_ability("preview", false).await;
+
+		let cam_a = cam.clone();
+		let task_a = tokio::spawn(async move { cam_a.get_snapshot().await });
+		let cam_b = cam.clone();
+		let task_b = tokio::spawn(async move { cam_b.get_snapshot().await });
+
+		// The lock forces request A's XML round trip (and its whole
+		// chunk sequence) to complete before B's request is even sent,
+		// so injecting A's chunks first, then giving B time to send
+		// its request and subscribe, then injecting B's chunks, is
+		// deterministic regardless of which task wins the lock race.
+		tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+		injector.push(binary_chunk(42, 200, vec![0xAA])).await;
+		injector
+			.push(binary_chunk(42, 201, vec![0xBB, 0xCC]))
+			.await;
+		tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+		injector.push(binary_chunk(43, 200, vec![0x11])).await;
+		injector
+			.push(binary_chunk(43, 201, vec![0x22, 0x33]))
+			.await;
+
+		let (res_a, res_b) = tokio::time::timeout(
+			tokio::time::Duration::from_millis(1000),
+			futures::future::join(task_a, task_b),
+		)
+		.await
+		.expect("did not hang");
+		let bytes_a = res_a.expect("join ok").expect("snapshot ok");
+		let bytes_b = res_b.expect("join ok").expect("snapshot ok");
+
+		let mut results = vec![bytes_a, bytes_b];
+		results.sort();
+		assert_eq!(
+			results,
+			vec![vec![0x11, 0x22, 0x33], vec![0xAA, 0xBB, 0xCC]],
+			"each snapshot must receive exactly its own chunks, un-mixed"
 		);
 	}
 

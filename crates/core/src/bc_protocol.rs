@@ -113,6 +113,21 @@ pub struct BcCamera {
 	/// that skips the password grant — and thus MFA — entirely; the fallback
 	/// when Reolink issued no `mfa_trust_token`. `None` when absent.
 	cloud_refresh_token: Option<String>,
+	/// Serializes `get_snapshot` calls on this camera.
+	///
+	/// `BcConnection::subscribe_to_id` keys its "wildcard" subscriber
+	/// slot on `(msg_id, None)` until the camera's first reply reveals
+	/// the real `msg_num`, at which point it upgrades that single slot
+	/// in place. Two concurrent `get_snapshot` calls (e.g. the preview
+	/// poller tick and an on-demand MQTT/RTSP-triggered snapshot) both
+	/// subscribe to `MSG_ID_SNAP` with `None`; the second subscription
+	/// silently replaces the first in that slot, so one caller's
+	/// binary chunks get delivered to (or lost from) the other's
+	/// channel — surfacing as "Snap truncated: got N bytes, expected M"
+	/// with N a multiple of the wire chunk size. Holding this lock for
+	/// the whole `get_snapshot` body forces snapshot fetches on this
+	/// camera to run one at a time, closing the race.
+	snap_lock: tokio::sync::Mutex<()>,
 }
 
 /// Options used to construct a camera
@@ -532,6 +547,7 @@ impl BcCamera {
 			cloud_uid: options.uid.clone(),
 			cloud_mfa_trust_token: options.cloud_mfa_trust_token.clone(),
 			cloud_refresh_token: options.cloud_refresh_token.clone(),
+			snap_lock: tokio::sync::Mutex::new(()),
 		};
 		// `keepalive` registers the inbound handler. If it fails, tear
 		// the just-started BcConnection down explicitly so we don't
@@ -650,6 +666,7 @@ impl BcCamera {
 			cloud_uid: None,
 			cloud_mfa_trust_token: None,
 			cloud_refresh_token: None,
+			snap_lock: tokio::sync::Mutex::new(()),
 		}
 	}
 
